@@ -1,23 +1,20 @@
 # Site settings
-title: Monochrome | A minimal, responsive Jekyll blog theme
-description: "A minimal, responsive, ready to use blog template, built with Jekyll."
-url: "http://www.dyutibarma.github.io/monochrome"
+title: "Florian Mattana"
+description: "From naive GEMM to Flash Attention — implementing and profiling GPU kernels in CUDA, documented step by step."
+url: "https://florianmattana.com"
 author:
-  name: "The Review Index"
-  email: "dyutibarma@gmail.com"
-  url: "https://thereviewindex.com"
+  name: "Florian Mattana"
+  email: ton-email@example.com
+  url: "https://florianmattana.com"
 
 # Build settings
-baseurl: /monochrome # Change this to your relative path (ex: /blog/), or leave just a /
+baseurl: ""
 markdown: kramdown
 source: .
 destination: ./_site
 permalink: /:title
 paginate: 8
 paginate_path: /page:num/
-title: "Florian Mattana"
-description: "From naive GEMM to Flash Attention — implementing and profiling GPU kernels in CUDA, documented step by step."
-url: "https://florianmattana.com"
 
 # Default values
 defaults:
