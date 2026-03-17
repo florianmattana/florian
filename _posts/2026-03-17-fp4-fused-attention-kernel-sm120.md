@@ -54,3 +54,43 @@ This is a meaningful difference from the INT8 WMMA instructions used in the Para
 
 Why this matters
 This finding is poorly documented across the ecosystem. Most Blackwell Tensor Core tutorials and references target SM100 exclusively and either ignore SM120 or simply warn that it is "different" without explaining how. The practical consequence for any developer targeting consumer Blackwell GPUs for FP4 compute is clear: use mma.sync rather than tcgen05, manage accumulators in registers rather than TMEM, and design tile sizes around the tighter shared memory budget. This is the architectural foundation that the rest of this kernel is built on.
+
+## 3. Instruction Selection and Block Scaling Tradeoffs
+
+Hardware-native block scaling
+A key concern when designing an FP4 kernel is whether the block scaling must be implemented manually in the kernel, or whether the hardware handles it natively. The PTX documentation confirms that the mma.sync instruction with the following .kind qualifiers performs matrix multiplication with built-in block scaling:
+
+.kind::mxf8f6f4
+.kind::mxf4
+.kind::mxf4nvf4
+The operation takes the form: D = (A × scale_A) × (B × scale_B) + C. Both operands A and B carry independent scale factors because they originate from different tensors (for instance, Q and K in the attention computation) with different value distributions. The hardware applies the dequantization during the multiply-accumulate, with no additional instructions required from the kernel. This eliminates an entire class of complexity that would otherwise consume shared memory bandwidth and register space.
+
+Register budget per MMA instruction
+Before selecting the specific instruction variant, I mapped the register footprint of a single FP4 MMA instruction with shape m16n8k32 to identify potential register pressure issues.
+
+The matrix A has shape 16×32 = 512 FP4 elements. At 4 bits per element, this is 2048 bits, fitting in 64 registers of 32 bits, distributed across 32 threads in a warp: 2 registers per thread. The matrix B has shape 32×8 = 256 FP4 elements, requiring 1 register per thread. The accumulator D has shape 16×8 = 128 elements stored in FP32 (32 bits each), requiring 4 registers per thread. The total is 7 registers per thread for a single MMA instruction.
+
+For comparison, the INT8 WMMA m16n16k16 instruction used in prior fused attention kernels produces a 16×16 output in INT32, requiring 256 elements of 32-bit accumulation distributed across the warp, resulting in a heavier register footprint. The FP4 instruction benefits from doubly compact operands (4 bits vs 8 bits) and a narrower output tile (16×8 vs 16×16). This reduced register pressure leaves more headroom for the online softmax state (row_max, row_sum) and for double-buffering tiles in registers, both of which are critical in a fused attention kernel.
+
+A practical consequence of the 16×8 output shape is that covering a 16×16 result tile requires two MMA instructions side by side, one for columns 0 through 7 and one for columns 8 through 15.
+
+Choosing between instruction variants
+The three .kind qualifiers supporting FP4 E2M1 differ in their block scaling granularity:
+
+.kind::mxf8f6f4 with E2M1 uses scale_vec::1X, providing 1 scale factor per group of 32 elements. .kind::mxf4 with E2M1 uses scale_vec::2X, providing 2 scale factors per group, equivalent to 1 scale factor per 16 elements. .kind::mxf4nvf4 with E2M1 supports scale_vec::2X or scale_vec::4X, providing 2 or 4 scale factors per group, with an additional option for ue4m3 scale format.
+
+This is a precision-versus-overhead tradeoff that can be evaluated quantitatively.
+
+Quantifying the tradeoff
+For a representative 64×64 tile containing 4096 FP4 elements, the data itself occupies 4096 × 0.5 bytes = 2048 bytes. The scale factor overhead depends on the granularity. With scale_vec::1X, there are 4096 / 32 = 128 scale factors at 1 byte each (UE8M0 format), adding 128 bytes for a 6.25% overhead. With scale_vec::2X, there are 4096 / 16 = 256 scale factors, adding 256 bytes for a 12.5% overhead.
+
+On the register side, the scale factors are encoded in UE8M0 (8 bits each). Moving from 1 byte to 2 bytes of scale data per operand still fits within a single 32-bit register. There is zero additional register cost.
+
+The precision benefit of finer-grained scaling is particularly relevant for the attention score matrix P, whose values lie in [0, 1] after softmax. SageAttention3 identifies this as a core challenge (C2 in their paper): when small post-softmax values are quantized to FP4, the scale factors collapse into an extremely narrow dynamic range, causing significant accuracy loss. Doubling the scale factor granularity from 1-per-32 to 1-per-16 helps contain this effect by allowing each smaller group to have its own adapted scale, at a cost of only 6.25 additional percentage points of memory overhead and zero additional register pressure.
+
+Final instruction choice
+Based on this analysis, the selected instruction is:
+
+mma.sync.aligned.kind::mxf4.block_scale.scale_vec::2X.m16n8k32
+
+With E2M1 data format, UE8M0 scale format, and a tile shape of 16×8×32. This provides the best balance between quantization precision and resource overhead for a fused attention kernel targeting SM120 consumer GPUs.
