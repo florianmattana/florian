@@ -14,7 +14,8 @@ This represents a significant missed opportunity. On a RTX 5070 Ti (GB205, 46 SM
 
 I design and implement an FP4 fused attention kernel specifically targeting the SM120 consumer GPU family beyond the RTX 5090. The kernel computes softmax(QKᵀ/√d)·V in a single pass using FP4 E2M1 quantization with hardware-native block scaling (one FP16 scale factor per 32 elements), online softmax for numerical stability, and tiled shared memory management optimized for the 128 KB per-SM shared memory and 12 GB VRAM constraints of consumer Blackwell GPUs.
 
-2. Design Decision: Instruction Path for FP4 Tensor Cores
+##2. Design Decision: Instruction Path for FP4 Tensor Cores
+
 The three options
 Before writing any kernel code, the first architectural decision was to determine how to invoke the FP4 Tensor Cores. Three options were evaluated.
 
