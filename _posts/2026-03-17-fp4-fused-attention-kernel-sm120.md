@@ -1,5 +1,5 @@
 ---
-title: Designing an FP4 Fused Attention Kernel for SM120
+title: Building an FP4 Fused Attention Kernel for Consumer Blackwell GPUs (SM120)
 description: Design document for a fused attention kernel targeting consumer Blackwell GPUs
 header: FP4 Fused Attention Kernel for SM120
 ---
