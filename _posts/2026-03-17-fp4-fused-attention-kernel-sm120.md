@@ -215,3 +215,44 @@ SageAttention3 targets SM100 (RTX 5090 and datacenter GPUs). It uses tcgen05.mma
 What we keep from their approach: the fused softmax-plus-quantization logic, the exp2 trick, the dual max computation, and the cvt.rn.satfinite.e2m1x2.f32 instruction for FP4 conversion. These are all valid on SM120.
 
 What we replace: TMA with cp.async, tcgen05.mma with mma.sync, CUTLASS pipeline abstractions with manual __syncthreads and cp.async.wait_group, and CuTe layout abstractions with explicit address calculations (as in gau-nernst's SM120 MXFP8 kernel).
+
+Testing the FP4 MMA instruction on SM120
+
+Before writing a full kernel, we needed to verify that a single FP4 MMA instruction works correctly on our GPU. This turned out to be much harder than expected, and the debugging process revealed critical undocumented details about how Blackwell handles FP4 data.
+
+The minimal test kernel
+
+The idea is simple: fill matrices A and B with known FP4 values, run one MMA instruction, and check whether the output matches the expected dot product. We launch a single warp (32 threads) and each thread declares its own registers for A, B, scale factors, and the accumulator D. After the MMA, each thread prints its four accumulator values.
+
+The instruction we target is the block-scaled variant:
+
+mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e2m1.e2m1.f32.ue8m0
+Each piece of this string matters. kind::mxf8f6f4 selects the instruction family that supports FP8, FP6, and FP4 types. block_scale enables hardware block scaling. scale_vec::1X means one scale factor per 32 elements along K. m16n8k32 defines the tile shape: 16 rows, 8 columns, 32 elements along the K dimension. e2m1.e2m1 specifies that both A and B are in FP4 E2M1 format. ue8m0 specifies the scale factor format.
+
+First surprise: the tile shape
+
+We initially assumed the FP4 instruction would use shape m16n8k64 since FP4 values are 4 bits and the hardware processes 32 bytes per step (32 bytes / 0.5 bytes per element = 64 elements). Every attempt to compile with m16n8k64 failed with "Incorrect instruction type specified for mma with shape m16n8k64".
+
+After reading CUTLASS source code and NVIDIA forum posts, we discovered that kind::mxf8f6f4 always uses shape m16n8k32 regardless of the element type. The K dimension in the shape name refers to the number of 8-bit containers, not the number of logical elements. For FP8, 32 containers hold 32 elements. For FP4, 32 containers still hold 32 elements because each FP4 value is padded into an 8-bit container.
+
+Second surprise: FP4 values are stored in 8-bit containers
+
+This was the hardest bug to find. We encoded FP4 1.0 as nibble 0x2 and packed eight of them into a 32-bit register as 0x22222222. The MMA ran without errors but produced 2.0 instead of the expected 64.0. We tested multiple values and the results were internally consistent but wrong.
+
+The answer came from a Discord discussion quoting the PTX documentation:
+
+"When .kind is either of .kind::mxf8f6f4 or .kind::f8f6f4, the individual 4-bit floating point type elements must be packed in an 8-bit container. The matrix element of type .e2m1 resides in central 4 bits of the 8-bit container with padding in the upper 2 bits and lower 2 bits of the container."
+
+Each FP4 value occupies one full byte. The 4-bit E2M1 value sits in bits 5 through 2, with two zero bits above and two zero bits below. So FP4 1.0 (0010 in E2M1) becomes 00 0010 00 in binary, which is 0x08, not 0x22.
+
+With the correct encoding 0x08080808, the MMA produces 32.0, which is exactly right: 32 elements along K, each contributing 1.0 times 1.0.
+
+Third surprise: scale_vec::2X is not available
+
+We planned to use scale_vec::2X for finer quantization granularity (one scale factor per 16 elements instead of 32). The compiler rejected it with "Illegal modifier .scale_vec::2X for instruction mma". On SM120 with kind::mxf8f6f4, only scale_vec::1X is supported. The 2X option exists on SM100 with the kind::mxf4nvf4 instruction family, which packs FP4 values as true 4-bit nibbles and runs at twice the throughput.
+
+What this means for the kernel
+
+On SM120 with kind::mxf8f6f4, FP4 runs at half the theoretical throughput because each 4-bit value wastes 4 bits of padding. The alternative instruction family kind::mxf4nvf4 avoids this waste but is not available on SM120. This is a hardware limitation of consumer Blackwell GPUs that datacenter parts (SM100) do not have.
+
+For our fused attention kernel, this means we work with scale_vec::1X (one scale per 32 elements) and accept the throughput penalty. The encoding rule (center the 4 bits in an 8-bit container) must be applied everywhere: when quantizing activations to FP4, when repacking P between the two MMAs, and when loading pre-quantized weights from memory.
