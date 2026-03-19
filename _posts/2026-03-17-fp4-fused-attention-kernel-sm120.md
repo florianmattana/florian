@@ -151,3 +151,67 @@ The shared memory cost at BQ=64, BK=64 is only 9216 bytes, leaving over 118 KB u
 ### MMA instruction mapping
 
 With the selected MMA instruction shape of m16n8k32, covering the S(64,64) result block requires 4 MMA blocks along the rows (64/16=4) and 8 MMA blocks along the columns (64/8=8), for a total of 32 MMA instructions per accumulation iteration. With D=128 requiring 4 accumulation iterations (128/32=4), each tile of K consumes 32×4 = 128 MMA instructions to produce the complete partial attention scores.
+
+Between the two MMAs: softmax, quantization, and repacking
+
+The fused attention kernel has three main steps: compute the scores (first MMA), apply softmax, then multiply by V (second MMA). The first and last steps are matrix multiplications handled by the Tensor Cores. What happens in between is the hard part, and it is where most of the engineering decisions live.
+
+The problem
+
+After the first MMA, we have the attention scores S sitting in FP32 registers across the 32 threads of each warp. These are raw dot products. We need to turn them into probabilities (softmax), then feed them into the second MMA as operand A. But the second MMA expects its input in FP4 E2M1, not FP32. So we need to do three things without leaving the registers: apply softmax, quantize from FP32 to FP4, and rearrange the data between threads because the output layout of the first MMA does not match the input layout of the second MMA.
+
+Why fuse softmax and quantization
+
+The naive approach would be to do softmax first (find the max, compute exponentials, sum, divide), and then in a second pass quantize the result to FP4 (find the absmax per block, divide, convert). That means reading every value from registers twice.
+
+SageAttention3 fuses both passes into one. While scanning the registers to find the row max for softmax, they simultaneously compute the absmax per block of 16 elements for the FP4 scale factor. While applying the exponential, they fold the FP4 scaling directly into the math. One pass over the data, two results.
+
+The trade-off: the code is significantly more complex. Every loop iteration does more work. But since registers are the most precious resource on SM120, reading them once instead of twice is worth the complexity.
+
+The exp2 trick
+
+Standard softmax computes exp(x - max). The GPU has no native hardware instruction for exp (base e). It does have a native instruction for exp2 (base 2), called ex2.approx.ftz.f32, which runs in a single cycle on the Special Function Unit.
+
+Since exp(x) = 2^(x * log2(e)), we can replace every exp call with an exp2 call by pre-multiplying x by log2(e), which is approximately 1.4427. This constant can be folded into the softmax scale factor (1/sqrt(D)), so we pay for one multiplication instead of two. The compiler can then fuse the multiply and subtract into a single fma instruction.
+
+Hypothesis: this optimization is well-established in GPU programming and is used by FlashAttention, SageAttention, and most production softmax implementations. We adopt it directly.
+
+Two max operations, one pass
+
+During the single pass over S, we compute two different max values.
+
+The first is the row max for softmax. This is the maximum value across an entire row of S (for example 64 elements if BK=64). It requires a warp shuffle reduction across 4 threads (XOR with offsets 1 and 2), because 4 threads jointly hold the elements of one row.
+
+The second is the absmax per block of 16 elements for the FP4 scale factor. This is a more local maximum. It only requires a warp shuffle across 2 threads (XOR with offset 1), because 2 neighboring threads hold one block of 16 elements.
+
+Both are computed in the same loop. When a thread scans its registers to accumulate the row max, it simultaneously tracks the block absmax. No extra register reads.
+
+Trade-off: the block absmax determines the FP4 scale factor. A block of 16 elements means one scale factor per 16 values (consistent with scale_vec::2X). Smaller blocks would give better precision but more scale factors to store and compute. Larger blocks would save overhead but lose precision on blocks with mixed magnitudes.
+
+Quantizing P from FP32 to FP4
+
+After softmax and scaling, each element of P has been divided by its block absmax, bringing values into the range that FP4 E2M1 can represent (0 to 6 for positive values after softmax). The actual conversion uses the PTX instruction cvt.rn.satfinite.e2m1x2.f32, which takes 2 FP32 values and outputs 2 FP4 values packed into a single byte. Four calls to this instruction fill one 32-bit register with 8 FP4 values.
+
+This is a hardware-native conversion. The GPU handles rounding (round to nearest) and clamping (satfinite means values too large are clamped to the maximum representable value, not set to infinity). No manual bit manipulation is needed.
+
+Trade-off: this is where precision loss happens. FP4 E2M1 has only 16 possible values. Softmax outputs are probabilities between 0 and 1, often with subtle differences (for example 0.12 vs 0.14). FP4 cannot distinguish these. SageAttention3 mitigates this by using per-block scaling, but some information is inevitably lost. The paper reports that for most practical models (diffusion, language), this loss does not significantly affect output quality.
+
+Repacking: from accumulator layout to operand layout
+
+The first MMA produces S in the accumulator layout (layout D). The second MMA expects P in the operand layout (layout A). These two layouts assign different matrix elements to different threads and different registers within each thread.
+
+Think of it this way: 32 threads each hold a few cards with numbers on them. After the first MMA, each thread has specific cards determined by layout D. The second MMA says "I need each thread to hold different specific cards, determined by layout A." The values are the same, but they need to physically move between threads.
+
+This rearrangement can be done via warp shuffles (threads exchange register values directly) or by writing to shared memory and reading back in the new order. SageAttention3 uses CuTe layout abstractions (LayoutP and LayoutSFP in kernel_traits.h) to handle this mapping. For our inline PTX kernel on SM120, we will need to implement this rearrangement manually.
+
+Trade-off: warp shuffles are faster (register to register, no memory access) but limited to exchanging between threads within the same warp. Shared memory is more flexible but adds latency and requires synchronization. The choice depends on how different the two layouts are. If only a few elements need to move between threads, shuffles are sufficient. If the mapping is complex, shared memory might be simpler to implement correctly even if slower.
+
+This repacking step is the single most error-prone part of the kernel. A mistake produces silent wrong results with no crash or warning. It is also the least documented part of existing implementations.
+
+What SageAttention3 uses that we cannot
+
+SageAttention3 targets SM100 (RTX 5090 and datacenter GPUs). It uses tcgen05.mma (fifth-generation Tensor Core instructions), TMA (Tensor Memory Access for hardware-managed loads), TMEM (Tensor Memory), and CuTe/CUTLASS abstractions. None of these are available on SM120 (RTX 5070 Ti, 5080).
+
+What we keep from their approach: the fused softmax-plus-quantization logic, the exp2 trick, the dual max computation, and the cvt.rn.satfinite.e2m1x2.f32 instruction for FP4 conversion. These are all valid on SM120.
+
+What we replace: TMA with cp.async, tcgen05.mma with mma.sync, CUTLASS pipeline abstractions with manual __syncthreads and cp.async.wait_group, and CuTe layout abstractions with explicit address calculations (as in gau-nernst's SM120 MXFP8 kernel).
