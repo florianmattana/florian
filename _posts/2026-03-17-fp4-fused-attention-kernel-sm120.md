@@ -256,3 +256,157 @@ What this means for the kernel
 On SM120 with kind::mxf8f6f4, FP4 runs at half the theoretical throughput because each 4-bit value wastes 4 bits of padding. The alternative instruction family kind::mxf4nvf4 avoids this waste but is not available on SM120. This is a hardware limitation of consumer Blackwell GPUs that datacenter parts (SM100) do not have.
 
 For our fused attention kernel, this means we work with scale_vec::1X (one scale per 32 elements) and accept the throughput penalty. The encoding rule (center the 4 bits in an 8-bit container) must be applied everywhere: when quantizing activations to FP4, when repacking P between the two MMAs, and when loading pre-quantized weights from memory.
+
+## 4. Encoding FP32 to FP4 E2M1: Building the Quantization Function
+
+### Why we need an encoding function
+
+The MMA test validated that the hardware produces correct results when given properly encoded FP4 data. But in that test, we hardcoded the register values (`0x08080808`). In the real kernel, Q, K, and V arrive as FP16 or FP32 tensors from PyTorch. Every value must be converted to FP4 E2M1 at runtime, inside the kernel, without a separate quantization pass. This means we need a device function that takes a float and returns the corresponding 8-bit container.
+
+### Anatomy of FP4 E2M1
+
+The format has 4 bits: 1 sign bit (S), 2 exponent bits (E), and 1 mantissa bit (M). The exponent bias is 1, computed from the standard IEEE formula: bias = 2^(number of exponent bits - 1) - 1 = 2^1 - 1 = 1. This bias is a fixed property of the format, not a per-value parameter.
+
+Decoding follows the same rules as IEEE 754. For normalized numbers (E > 0): value = (-1)^S × 1.M × 2^(E - bias). The `1.M` notation means an implicit leading 1 followed by the mantissa bit after a binary point. With M = 0, `1.M` = `1.0` in binary = 1.0 in decimal. With M = 1, `1.M` = `1.1` in binary = 1.5 in decimal (because the first digit after the binary point represents 2^(-1) = 0.5).
+
+For denormalized numbers (E = 0): value = (-1)^S × 0.M × 2^(1 - bias). The implicit leading bit becomes 0 instead of 1. This allows representation of values smaller than the smallest normalized number.
+
+The complete value table:
+
+| Nibble | S | E  | M | Value |
+|--------|---|----|---|-------|
+| 0000   | 0 | 00 | 0 | +0.0  |
+| 0001   | 0 | 00 | 1 | +0.5  |
+| 0010   | 0 | 01 | 0 | +1.0  |
+| 0011   | 0 | 01 | 1 | +1.5  |
+| 0100   | 0 | 10 | 0 | +2.0  |
+| 0101   | 0 | 10 | 1 | +3.0  |
+| 0110   | 0 | 11 | 0 | +4.0  |
+| 0111   | 0 | 11 | 1 | +6.0  |
+| 1000   | 1 | 00 | 0 | -0.0  |
+| 1001   | 1 | 00 | 1 | -0.5  |
+| 1010   | 1 | 01 | 0 | -1.0  |
+| 1011   | 1 | 01 | 1 | -1.5  |
+| 1100   | 1 | 10 | 0 | -2.0  |
+| 1101   | 1 | 10 | 1 | -3.0  |
+| 1110   | 1 | 11 | 0 | -4.0  |
+| 1111   | 1 | 11 | 1 | -6.0  |
+
+Only 16 possible values. The distribution is non-uniform: resolution is finest near zero (steps of 0.5 between 0.0, 0.5, 1.0, 1.5) and coarsest at the extremes (a jump of 2.0 between 4.0 and 6.0). This is inherent to floating-point representation and is the fundamental tradeoff of aggressive quantization.
+
+### Building the encoding function step by step
+
+#### Step 1: Extract the sign
+
+The FP4 value table is symmetric: the positive and negative halves are mirrors of each other, differing only in the sign bit. This means we can separate the problem into two independent parts: determine the sign, then find the correct magnitude. We extract the sign, work on the absolute value, and reattach the sign at the end.
+
+```cuda
+__device__ uint8_t encode_fp4_e2m1(float val) {
+    uint8_t sign = (val < 0.f) ? 1 : 0;
+    float abs_val = fabsf(val);
+    return 0; // placeholder
+}
+Copy
+fabsf is a CUDA intrinsic that returns the absolute value of a float. The ternary operator (condition) ? a : b evaluates to a if the condition is true, b otherwise. After these two lines, sign holds 0 or 1, and abs_val holds the positive magnitude. The float itself uses a completely different 32-bit format internally, so we cannot simply "read the first bit" as we would with a finished FP4 nibble—we need this explicit comparison.
+
+Step 2: Find the nearest FP4 value by rounding
+Given abs_val, we need to find which of the 8 positive FP4 values (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0) is closest. The standard approach is to compare against midpoints between consecutive values. The midpoint is where rounding switches from the lower value to the higher one:
+
+Between	Midpoint
+0.0 and 0.5	0.25
+0.5 and 1.0	0.75
+1.0 and 1.5	1.25
+1.5 and 2.0	1.75
+2.0 and 3.0	2.5
+3.0 and 4.0	3.5
+4.0 and 6.0	5.0
+Values above 5.0 are clamped (saturated) to 6.0, the maximum representable magnitude. This is implemented as a chain of comparisons starting from the largest value:
+
+uint8_t nibble;
+if      (abs_val >= 5.0f)  nibble = 0x7;  // 6.0
+else if (abs_val >= 3.5f)  nibble = 0x6;  // 4.0
+else if (abs_val >= 2.5f)  nibble = 0x5;  // 3.0
+else if (abs_val >= 1.75f) nibble = 0x4;  // 2.0
+else if (abs_val >= 1.25f) nibble = 0x3;  // 1.5
+else if (abs_val >= 0.75f) nibble = 0x2;  // 1.0
+else if (abs_val >= 0.25f) nibble = 0x1;  // 0.5
+else                       nibble = 0x0;  // 0.0
+On a GPU, this chain of comparisons with compile-time constants is efficient: the compiler converts it to predicated instructions without branch divergence. A lookup table alternative would require a shared memory or constant memory access, which would be slower for such a short sequence.
+
+The nibble values (0x0 through 0x7) are the 3-bit magnitude encodings from the FP4 table: exponent and mantissa without the sign bit.
+
+Step 3: Attach the sign bit
+The sign bit occupies position 3 of the nibble (the most significant bit of the 4-bit FP4 value). We count bit positions from right to left starting at 0:
+
+position:  3  2  1  0
+           S  E  E  M
+To place the sign at position 3, we shift it left by 3 and combine it with the magnitude using a bitwise OR:
+
+nibble |= (sign << 3);
+The operator << shifts bits to the left. If sign = 1, then 1 << 3 produces binary 1000. The operator | (bitwise OR) combines two bit patterns: wherever either input has a 1, the result has a 1. Since the sign bit (position 3) and the magnitude bits (positions 0–2) occupy non-overlapping positions, the OR assembles them without interference.
+
+The shorthand nibble |= x is equivalent to nibble = nibble | x.
+
+Example: encoding -1.0. The magnitude nibble is 0010 (+1.0). The sign is 1. After 1 << 3 = 1000, the OR gives 0010 | 1000 = 1010, which is the correct FP4 encoding for -1.0.
+
+Step 4: Place in the 8-bit container
+As discovered during MMA testing, kind::mxf8f6f4 on SM120 requires each FP4 value to sit at bits 5 through 2 of an 8-bit container, with bits 7–6 and bits 1–0 set to zero. This is achieved with a left shift of 2:
+
+return (uint8_t)(nibble << 2);
+The final byte layout:
+
+bit:     7  6  5  4  3  2  1  0
+         0  0  S  E  E  M  0  0
+Example: nibble 1010 (-1.0) shifted left by 2 becomes 00101000 = 0x28.
+
+The complete function
+__device__ uint8_t encode_fp4_e2m1(float val) {
+    uint8_t sign = (val < 0.f) ? 1 : 0;
+    float abs_val = fabsf(val);
+
+    uint8_t nibble;
+    if      (abs_val >= 5.0f)  nibble = 0x7;
+    else if (abs_val >= 3.5f)  nibble = 0x6;
+    else if (abs_val >= 2.5f)  nibble = 0x5;
+    else if (abs_val >= 1.75f) nibble = 0x4;
+    else if (abs_val >= 1.25f) nibble = 0x3;
+    else if (abs_val >= 0.75f) nibble = 0x2;
+    else if (abs_val >= 0.25f) nibble = 0x1;
+    else                       nibble = 0x0;
+
+    nibble |= (sign << 3);
+
+    return (uint8_t)(nibble << 2);
+}
+Validation
+We tested the encoding function against known values, then fed the encoded values into the MMA instruction to verify end-to-end correctness.
+
+Unit tests of the encoding function:
+
+Input	Expected nibble	Expected container	Observed
+1.0	0010	0x08	0x08 ✓
+-1.0	1010	0x28	0x28 ✓
+6.0	0111	0x1C	0x1C ✓
+1.2	0010 (rounded to 1.0)	0x08	0x08 ✓
+The rounding test (1.2 → 1.0) confirms that the midpoint logic works: 1.2 < 1.25 (the midpoint between 1.0 and 1.5), so the function correctly rounds down.
+
+Packing encoded values into 32-bit registers
+The MMA instruction expects its operands as 32-bit registers. Each register holds 4 encoded FP4 values (one per byte). Packing uses bitwise shifts and OR to place each byte at the correct position within the 32-bit word:
+
+uint8_t e0 = encode_fp4_e2m1(1.0f);
+uint32_t packed = e0 | (e0 << 8) | (e0 << 16) | (e0 << 24);
+The shift amounts correspond to byte boundaries within the 32-bit register: e0 occupies bits 7–0, e0 << 8 occupies bits 15–8, e0 << 16 occupies bits 23–16, and e0 << 24 occupies bits 31–24. Since these ranges do not overlap, the bitwise OR assembles all four bytes into a single word. The resulting value is 0x08080808, identical to what we hardcoded in the earlier MMA test.
+
+End-to-end MMA validation
+With the encoded and packed values replacing the hardcoded constants:
+
+uint8_t e0 = encode_fp4_e2m1(1.0f);
+uint32_t packed = e0 | (e0 << 8) | (e0 << 16) | (e0 << 24);
+
+uint32_t A[4] = {packed, packed, packed, packed};
+uint32_t B[2] = {packed, packed};
+The MMA produced 32.0 across all 32 lanes, matching the expected result (32 K-elements, each 1.0 × 1.0, summed).
+
+We repeated the test with encode_fp4_e2m1(2.0f), which produced 128.0 (= 32 × 2.0 × 2.0), confirming that the full pipeline—encoding, packing, and hardware MMA—works correctly for non-trivial values.
+
+The encoding function is now validated and ready to be used in the fused attention kernel. It lives in common.h so that both test files and the final kernel can include it.
