@@ -167,7 +167,7 @@ I wrote a minimal test kernel: launch a single warp (32 threads), each thread de
 
 The instruction I targeted:
 
-mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e2m1.e2m1.f32.ue8m0
+mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X .m16n8k32.row.col.f32.e2m1.e2m1.f32.ue8m0
 
 
 Every piece of this string matters. `kind::mxf8f6f4` selects the instruction family that supports FP8, FP6, and FP4 types. `block_scale` enables hardware block scaling. `scale_vec::1X` means one scale factor per 32 elements along K. `m16n8k32` defines the tile shape: 16 rows, 8 columns, 32 elements along K. `e2m1.e2m1` specifies FP4 E2M1 for both A and B. `ue8m0` is the scale factor format.
@@ -181,7 +181,7 @@ Every attempt to compile with m16n8k64 failed:
 error: "Incorrect instruction type specified for mma with shape m16n8k64"
 
 
-I spent time going through CUTLASS source and NVIDIA forum posts before finding the answer. With `kind::mxf8f6f4`, the shape is always m16n8k32 regardless of element type. The K dimension in the shape name refers to the number of **8-bit containers**, not the number of logical elements. For FP8, 32 containers hold 32 elements. For FP4, 32 containers still hold 32 elements — because each FP4 value is padded into an 8-bit container.
+I spent time going through CUTLASS source and NVIDIA forum posts before finding the answer. With `kind::mxf8f6f4`, the shape is always m16n8k32 regardless of element type. The K dimension in the shape name refers to the number of 8-bit containers, not the number of logical elements. For FP8, 32 containers hold 32 elements. For FP4, 32 containers still hold 32 elements — because each FP4 value is padded into an 8-bit container.
 
 This was my first hint that the 8-bit container rule would be important. I did not fully appreciate it yet.
 
@@ -199,7 +199,7 @@ I tested with other values. The results were internally consistent — doubling 
 
 After several hours, I found the answer in a Discord thread quoting the PTX documentation:
 
-> *"When .kind is either of .kind::mxf8f6f4 or .kind::f8f6f4, the individual 4-bit floating point type elements must be packed in an 8-bit container. The matrix element of type .e2m1 resides in central 4 bits of the 8-bit container with padding in the upper 2 bits and lower 2 bits of the container."*
+> "When .kind is either of .kind::mxf8f6f4 or .kind::f8f6f4, the individual 4-bit floating point type elements must be packed in an 8-bit container. The matrix element of type .e2m1 resides in central 4 bits of the 8-bit container with padding in the upper 2 bits and lower 2 bits of the container."
 
 Each FP4 value occupies one full byte. The 4 data bits sit at positions 5 through 2, with two zero bits above and two zero bits below:
 
@@ -220,12 +220,12 @@ For reference, here is the `asm volatile` block that runs the MMA. The syntax fo
 asm volatile(
     "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X"
     ".m16n8k32.row.col.f32.e2m1.e2m1.f32.ue8m0 "
-    "{%0,%1,%2,%3}, "          // D: 4 FP32 accumulators
-    "{%4,%5,%6,%7}, "          // A: 4 uint32 registers
-    "{%8,%9}, "                // B: 2 uint32 registers
-    "{%10,%11,%12,%13}, "      // C: 4 FP32 accumulators (input)
-    "{%14},{%15,%16}, "        // scale_A + metadata
-    "{%17},{%18,%19};"         // scale_B + metadata
+    "{%0,%1,%2,%3}, "
+    "{%4,%5,%6,%7}, "
+    "{%8,%9}, "
+    "{%10,%11,%12,%13}, "
+    "{%14},{%15,%16}, "
+    "{%17},{%18,%19};"
     : "=f"(D[0]), "=f"(D[1]), "=f"(D[2]), "=f"(D[3])
     : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
       "r"(B[0]), "r"(B[1]),
@@ -233,18 +233,18 @@ asm volatile(
       "r"(sf_a), "h"((short)0), "h"((short)0),
       "r"(sf_b), "h"((short)0), "h"((short)0)
 );
-The "r" constraints are 32-bit integer registers (for the FP4 data packed into uint32), "f" are 32-bit float registers (for the FP32 accumulator), and "h" are 16-bit half registers (for the scale factor metadata, set to zero in our case). The volatile keyword tells the compiler not to reorder, duplicate, or eliminate this block — critical for a warp-synchronous instruction that must execute exactly once, exactly where placed.
+The "r" constraints are 32-bit integer registers (for the FP4 data packed into uint32), "f" are 32-bit float registers (for the FP32 accumulator), and "h" are 16-bit half registers (for the scale factor metadata, set to zero). The volatile keyword tells the compiler not to reorder, duplicate, or eliminate this block — critical for a warp-synchronous instruction that must execute exactly once, exactly where placed.
 
-One important detail: the MMA is warp-synchronous. All 32 threads must participate. Launching the test kernel with <<<1, 1>>> (a single thread) produces all zeros — the instruction silently does nothing because the warp is incomplete. I had to use <<<1, 32>>> to get results. This was another 20 minutes of confusion before I remembered the constraint.
+One important detail: the MMA is warp-synchronous. All 32 threads must participate. Launching the test kernel with a single thread produces all zeros — the instruction silently does nothing because the warp is incomplete. I had to use 32 threads to get results. This was another 20 minutes of confusion before I remembered the constraint.
 
 What I learned from the test
 Three things came out of this test, in order of how much time they cost me:
 
-The 8-bit container rule: FP4 values are not packed two per byte on SM120 with kind::mxf8f6f4. Each value occupies a full byte, centered at bits 5–2. This encoding must be applied everywhere in the kernel — when quantizing activations, when repacking the score matrix between the two MMAs, when loading pre-quantized weights.
+The 8-bit container rule. FP4 values are not packed two per byte on SM120 with kind::mxf8f6f4. Each value occupies a full byte, centered at bits 5–2. This encoding must be applied everywhere in the kernel — when quantizing activations, when repacking the score matrix between the two MMAs, when loading pre-quantized weights.
 
-The shape rule: m16n8k32 counts containers, not elements. For FP4, 32 containers = 32 elements (not 64), because of the one-value-per-byte packing.
+The shape rule. m16n8k32 counts containers, not elements. For FP4, 32 containers = 32 elements (not 64), because of the one-value-per-byte packing.
 
-The throughput implication: each 4-bit value wastes 4 bits of padding. SM120's FP4 throughput is effectively halved compared to what it could be if kind::mxf4nvf4 (true 4-bit packing) were available. This is a hardware limitation of consumer Blackwell that datacenter SM100 does not have.
+The throughput implication. Each 4-bit value wastes 4 bits of padding. SM120's FP4 throughput is effectively halved compared to what it could be if kind::mxf4nvf4 (true 4-bit packing) were available. This is a hardware limitation of consumer Blackwell that datacenter SM100 does not have.
 
 5. Encoding FP32 to FP4 E2M1
 Why we need an encoding function
@@ -259,7 +259,7 @@ For denormalized numbers (E = 0): value = (-1)^S × 0.M × 2^(1 - bias). The imp
 
 The complete table:
 
-Nibble (binary)	S	E	M	Value
+Nibble	S	E	M	Value
 0000	0	00	0	+0.0
 0001	0	00	1	+0.5
 0010	0	01	0	+1.0
@@ -351,27 +351,31 @@ __device__ uint8_t encode_fp4_e2m1(float val) {
 Validation
 I tested the encoding function against known values, then fed the results into the MMA instruction to verify end-to-end correctness.
 
-Unit tests:
-
-Input	Expected nibble	Expected container	Observed
+Input	Expected nibble	Expected byte	Observed
 1.0	0010	0x08	0x08 ✓
 -1.0	1010	0x28	0x28 ✓
 6.0	0111	0x1C	0x1C ✓
-1.2	0010 (→ 1.0)	0x08	0x08 ✓
+1.2	0010 (rounded to 1.0)	0x08	0x08 ✓
 The rounding test (1.2 → 1.0) confirms the midpoint logic: 1.2 < 1.25 (midpoint between 1.0 and 1.5), so the function rounds down correctly.
 
 Packing into 32-bit registers
 The MMA instruction expects operands as 32-bit registers. Each register holds 4 encoded FP4 values, one per byte. Packing uses shifts and OR to place each byte at the correct position:
 
 uint8_t e0 = encode_fp4_e2m1(1.0f);
-uint32_t packed = e0 | (e0 << 8) | (e0 << 16) | (e0 << 24);
+uint32_t packed = e0
+    | (e0 << 8)
+    | (e0 << 16)
+    | (e0 << 24);
 e0 goes to bits 7–0, e0 << 8 to bits 15–8, e0 << 16 to bits 23–16, e0 << 24 to bits 31–24. The four byte lanes do not overlap, so the OR assembles them cleanly. The result is 0x08080808, identical to what I hardcoded in the earlier MMA test.
 
 End-to-end MMA validation
 With the encoded and packed values replacing the hardcoded constants:
 
 uint8_t e0 = encode_fp4_e2m1(1.0f);
-uint32_t packed = e0 | (e0 << 8) | (e0 << 16) | (e0 << 24);
+uint32_t packed = e0
+    | (e0 << 8)
+    | (e0 << 16)
+    | (e0 << 24);
 
 uint32_t A[4] = {packed, packed, packed, packed};
 uint32_t B[2] = {packed, packed};
@@ -394,12 +398,12 @@ This is not a rounding problem — it is a saturation problem. The encoding func
 The idea behind scale factors
 The solution is to divide every value in a block by a common factor before encoding, so that the proportions between values are preserved even though the absolute magnitudes change.
 
-I tested this concretely. With a block of {12.0, 10.0, 3.0, -7.0}, dividing by 16 (the next power of two above the largest absolute value):
+I tested this concretely. With a block containing 12.0, 10.0, 3.0, and -7.0, dividing by 16 (the next power of two above the largest absolute value):
 
-encode(12.0 / 16.0) = 0x08   →  1.0
-encode(10.0 / 16.0) = 0x04   →  0.5
-encode( 3.0 / 16.0) = 0x00   →  0.0
-encode(-7.0 / 16.0) = 0x24   → -0.5
+encode(12.0 / 16.0) = 0x08   (1.0)
+encode(10.0 / 16.0) = 0x04   (0.5)
+encode( 3.0 / 16.0) = 0x00   (0.0)
+encode(-7.0 / 16.0) = 0x24   (-0.5)
 Without the scale factor, 12.0 and 10.0 both mapped to 0x1C — indistinguishable. With it, they map to 0x08 and 0x04. The proportions are not perfectly preserved (the true ratio 10/12 ≈ 0.83 rounds to 0.5/1.0 = 0.5), but the values are at least distinct. In a 4-bit format with 16 possible outputs, this is the best you can do.
 
 The hardware needs to know what divisor was used, so it can undo the division during the MMA. If we divided by 16, the MMA result must be multiplied by 16 to restore correct magnitude. This multiplication happens automatically inside the Tensor Core — the scale factor is a register operand alongside the data, and the hardware applies it during the multiply-accumulate. No extra instructions.
@@ -407,7 +411,7 @@ The hardware needs to know what divisor was used, so it can undo the division du
 Why the scale factor must be a power of two
 The MMA instruction accepts scale factors in UE8M0 format: 8-bit unsigned, 8 exponent bits, zero mantissa bits. No sign, no fractional part. The value it represents is 2^(stored_byte - 127), where 127 is the exponent bias — the same convention as FP32, borrowed from the OCP Microscaling Formats (MX) specification.
 
-Because there is no mantissa, UE8M0 can only encode powers of two: 2^(-127), ..., 1, 2, 4, 8, 16, ..., 2^127. You cannot store 12.0 as a scale factor. You store either 8 (2^3) or 16 (2^4).
+Because there is no mantissa, UE8M0 can only encode powers of two: 1, 2, 4, 8, 16, and so on up to 2^127 (and down to 2^-127). You cannot store 12.0 as a scale factor. You store either 8 (2^3) or 16 (2^4).
 
 This constraint is deliberate. Multiplying by a power of two is an exponent shift in IEEE 754 representation — zero additional logic inside the Tensor Core. A non-power-of-two scale would require a real multiply, eating into throughput.
 
@@ -423,9 +427,8 @@ The MX standard rounds up. I follow the same convention.
 Computing the UE8M0 byte
 Three operations:
 
-Find the maximum absolute value in the block.
-Compute the smallest integer exponent such that 2^exponent ≥ max_abs: exponent = ceil(log2(max_abs)).
-Add the bias: byte = exponent + 127.
+Find the maximum absolute value in the block. Compute the smallest integer exponent such that 2^exponent is greater than or equal to max_abs: exponent = ceil(log2(max_abs)). Add the bias: byte = exponent + 127.
+
 Concrete example: max_abs = 12.0. log2f(12.0) = 3.58. ceilf(3.58) = 4. Exponent is 4. Stored byte: 4 + 127 = 131.
 
 Verification: hardware reads 131, subtracts the bias (131 - 127 = 4), computes 2^4 = 16. The MMA multiplies its result by 16. Correct.
@@ -455,7 +458,7 @@ The MMA computes the dot product: 1.0 × 1.0 × 32 = 32. Hardware multiplies by 
 
 All 32 lanes reported 256.0. The scale factor is correctly applied by the hardware.
 
-8.0 is a power of two, so the scale factor lands exactly on the block maximum — no rounding loss. In practice, non-power-of-two maxima introduce a gap between the actual maximum and the scale factor. A block with max 12.0 uses a scale of 16, meaning FP4's range [0, 6.0] maps to [0, 96.0], while the data only occupies [0, 12.0]. Three quarters of the representable range is wasted. This is the cost of restricting scale factors to powers of two.
+8.0 is a power of two, so the scale factor lands exactly on the block maximum — no rounding loss. In practice, non-power-of-two maxima introduce a gap between the actual maximum and the scale factor. A block with max 12.0 uses a scale of 16, meaning FP4's range of 0 to 6.0 maps to 0 to 96.0, while the data only occupies 0 to 12.0. Three quarters of the representable range is wasted. This is the cost of restricting scale factors to powers of two.
 
 Block size: precision versus overhead
 On SM120 with kind::mxf8f6f4 and scale_vec::1X, each scale factor covers 32 consecutive elements along K. This is not configurable — the instruction dictates it.
@@ -472,9 +475,6 @@ encode_fp4_e2m1(float val) — converts a float to an 8-bit FP4 E2M1 container, 
 compute_scale_ue8m0(float* block, int size) — computes the UE8M0 scale factor for a block of floats, rounding up to the next power of two.
 
 Together they form the quantization pass: find the scale, divide, encode. The MMA receives both the encoded data and the scale factor, and produces the correctly scaled FP32 result.
-
-{% endraw %}
-
 
 Both functions live in common.h. The test file and the final kernel include the same header.
 
