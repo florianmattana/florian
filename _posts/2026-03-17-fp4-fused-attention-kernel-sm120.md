@@ -3,6 +3,7 @@ title: Building an FP4 Fused Attention Kernel for Consumer Blackwell GPUs (SM120
 description: Design document for a fused attention kernel targeting consumer Blackwell GPUs
 header: FP4 Fused Attention Kernel for SM120
 ---
+{% raw %}
 
 ## 1. Why This Kernel Needs to Exist
 
@@ -471,6 +472,9 @@ encode_fp4_e2m1(float val) — converts a float to an 8-bit FP4 E2M1 container, 
 compute_scale_ue8m0(float* block, int size) — computes the UE8M0 scale factor for a block of floats, rounding up to the next power of two.
 
 Together they form the quantization pass: find the scale, divide, encode. The MMA receives both the encoded data and the scale factor, and produces the correctly scaled FP32 result.
+
+{% endraw %}
+
 
 Both functions live in common.h. The test file and the final kernel include the same header.
 
